@@ -89,52 +89,22 @@ def build_human_explanation(attack_type, tokens, payload):
 
 def run_ml_check(payload):
     """Run ML check and return result dict. Shared by all endpoints."""
-    p = (payload or "").strip()
-    s = p.lower()
-
-    # ------------------------------------------------------------
-    # Rule-based fast-path (deterministic): block obviously malicious
-    # inputs and still return a consistent explanation payload.
-    # ------------------------------------------------------------
-    matched = []
-    if any(k in s for k in ["../", "..\\", "%2e%2e%2f", "%2e%2e\\", "%252e%252e%252f"]):
-        matched += ["../", "..\\"]
-    if any(k in s for k in ["; ", "&&", "||", "| ", "`", "$(", "cmd.exe", "powershell", "/bin/sh", "/bin/bash"]):
-        matched += ["&&", "||", "`", "$("]
-    if any(k in s for k in ["<script", "</script", "onerror=", "onload=", "javascript:"]):
-        matched += ["<script", "javascript:", "onerror=", "onload="]
-    if any(k in s for k in [" union ", " select ", " or 1=1", "' or '1'='1", "--", "/*", "*/", " drop ", " insert ", " update ", " delete "]):
-        matched += ["select", "union", "drop", "--", "/*"]
-
-    matched = [m for i, m in enumerate(matched) if m and m in p and m not in matched[:i]]
-
-    if matched:
-        tokens = [(m, 1.0) for m in matched[:10]]
-        attack_type = detect_attack_type(p, tokens)
-        explanation = build_human_explanation(attack_type, tokens, p)
-        return {
-            "block": True,
-            "attack_type": attack_type,
-            "confidence": 1.0,
-            "explanation": explanation
-        }
-
-    if len(p) < 3:
+    if len(payload.strip()) < 3:
         return {"block": False, "reason": "Input is too short to be considered an attack."}
-    if re.fullmatch(r"[a-zA-Z\s]+", p):
+    if re.fullmatch(r"[a-zA-Z\s]+", payload.strip()):
         return {"block": False, "reason": "Input contains only plain text."}
 
-    X = vectorizer.transform([p])
+    X = vectorizer.transform([payload])
     probs = model.predict_proba(X)[0]
     attack_prob = probs[1]
     THRESHOLD = 0.80
 
-    exp = explainer.explain_instance(p, predict_proba, num_features=10)
+    exp = explainer.explain_instance(payload, predict_proba, num_features=10)
     tokens = exp.as_list()
 
     if attack_prob >= THRESHOLD:
-        attack_type = detect_attack_type(p, tokens)
-        explanation = build_human_explanation(attack_type, tokens, p)
+        attack_type = detect_attack_type(payload, tokens)
+        explanation = build_human_explanation(attack_type, tokens, payload)
         return {
             "block": True,
             "attack_type": attack_type,
@@ -382,11 +352,11 @@ def index():
 def waf_api():
     """
     Expects: {"payload": "...", "source": "search|login|register"}
-    Returns: {"block": true/false}  — full details are kept server-side only.
+    Returns: {"block": true/false, "attack_type": ..., "confidence": ..., "explanation": ...}
     """
     data = request.get_json(silent=True)
     if not data or "payload" not in data:
-        return jsonify({"block": False}), 400
+        return jsonify({"block": False, "error": "No payload provided"}), 400
 
     payload = data["payload"]
     source = data.get("source", "web-app")
@@ -394,7 +364,6 @@ def waf_api():
     res = run_ml_check(payload)
 
     if res["block"]:
-        # Store full details in admin dashboard (server-side only)
         alert_store.append({
             "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
             "attack_type": res["attack_type"],
@@ -403,33 +372,19 @@ def waf_api():
             "payload": payload,
             "source": source
         })
-        # Log to server stdout (visible only in Render logs)
-        print(f"[WAF BLOCK] source={source} | attack={res['attack_type']} "
-              f"| confidence={res['confidence']:.2f} | payload={payload[:120]}",
-              flush=True)
-        # Return ONLY block decision — no attack details exposed to callers
-        return jsonify({"block": True})
 
-    return jsonify({"block": False})
+    return jsonify(res)
 
 
 # ============================================================
 # NOTIFICATION endpoint (extra: web app can push alerts here)
 # ============================================================
-NOTIFY_SECRET = os.environ.get("NOTIFY_SECRET", "")
-
 @app.route("/api/notify", methods=["POST"])
 def notify():
     """
-    Receives pre-built alert notifications from the trusted Node.js web app.
+    Receives pre-built alert notifications from the web app.
     Body: {attack_type, confidence, explanation, payload, source}
-    Protected by X-Notify-Secret header (set NOTIFY_SECRET env var on Render).
     """
-    if NOTIFY_SECRET:
-        incoming = request.headers.get("X-Notify-Secret", "")
-        if incoming != NOTIFY_SECRET:
-            return jsonify({"status": "error", "message": "Unauthorized"}), 403
-
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"status": "error", "message": "No data"}), 400
