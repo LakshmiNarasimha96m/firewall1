@@ -5,6 +5,7 @@ import re
 import os
 from datetime import datetime
 from collections import deque
+from urllib.parse import unquote_plus
 
 # -----------------------------
 # Load trained model
@@ -26,6 +27,140 @@ app = Flask(__name__)
 
 # In-memory alert store (last 200 alerts)
 alert_store = deque(maxlen=200)
+
+# -----------------------------
+# WAF helpers (server-side)
+# -----------------------------
+EXEMPT_PREFIXES = (
+    "/admin",
+    "/api/waf",
+    "/api/notify",
+    "/health",
+)
+
+def _flatten_values(values):
+    out = []
+    for k in values.keys():
+        for v in values.getlist(k):
+            out.append((k, v))
+    return out
+
+def extract_request_payload(req):
+    """
+    Builds a single string from query params, form fields, and JSON values.
+    This is used by `before_request` to do *server-side* inspection.
+    """
+    parts = []
+
+    # Query string
+    for k, v in _flatten_values(req.args):
+        parts.append(f"query.{k}={v}")
+
+    # Form body
+    for k, v in _flatten_values(req.form):
+        parts.append(f"form.{k}={v}")
+
+    # JSON body (best-effort, silent)
+    data = req.get_json(silent=True)
+    if isinstance(data, dict):
+        for k, v in data.items():
+            parts.append(f"json.{k}={v}")
+    elif isinstance(data, list):
+        parts.append(f"json.list={data}")
+
+    # Raw URL-decoded query string (catches encoded payloads like %3Cscript%3E)
+    if req.query_string:
+        try:
+            parts.append("raw_qs=" + unquote_plus(req.query_string.decode("utf-8", errors="ignore")))
+        except Exception:
+            pass
+
+    return " | ".join([str(p) for p in parts if p is not None]).strip()
+
+def is_json_request(req):
+    ct = (req.headers.get("Content-Type") or "").lower()
+    accept = (req.headers.get("Accept") or "").lower()
+    return "application/json" in ct or "application/json" in accept
+
+BLOCK_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Blocked</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background:#0b0f19; color:#e5e7eb; margin:0; }
+    .wrap { max-width: 920px; margin: 56px auto; padding: 0 18px; }
+    .card { background:#111827; border:1px solid #1f2937; border-radius: 12px; padding: 22px; }
+    .title { display:flex; gap:12px; align-items:center; font-weight: 800; font-size: 20px; }
+    .badge { background:#7f1d1d; color:#fecaca; border:1px solid #991b1b; border-radius:999px; padding: 2px 10px; font-size: 12px; font-weight:700; }
+    .muted { color:#9ca3af; font-size: 13px; margin-top: 6px; }
+    .row { margin-top: 16px; display:grid; grid-template-columns: 140px 1fr; gap: 10px; }
+    .k { color:#9ca3af; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+    .v { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size: 12px; background:#0b1220; border:1px solid #1f2937; padding: 10px; border-radius: 10px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="title">
+        <span class="badge">Blocked</span>
+        Your request was blocked by the security firewall.
+      </div>
+      <div class="muted">If you believe this is an error, contact the administrator.</div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+@app.before_request
+def waf_server_side_guard():
+    """
+    Server-side WAF:
+    - Runs *before* route handlers.
+    - Inspects incoming request data and blocks on detection.
+
+    This complements client-side blocking: even if JS is bypassed, the server still blocks.
+    """
+    if request.method == "OPTIONS":
+        return None
+
+    path = request.path or ""
+    if any(path.startswith(p) for p in EXEMPT_PREFIXES):
+        return None
+
+    # Keep the built-in demo UI behavior unchanged.
+    if request.endpoint == "index":
+        return None
+
+    # Only inspect "unsafe" methods by default; allow GET too because query strings are common attack vectors.
+    if request.method not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+        return None
+
+    payload = extract_request_payload(request)
+    if not payload:
+        return None
+
+    res = run_ml_check(payload)
+    if not res.get("block"):
+        return None
+
+    # Store alert (source: server-side-guard)
+    alert_store.append({
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "attack_type": res.get("attack_type", "Unknown"),
+        "confidence": res.get("confidence", 0),
+        "explanation": res.get("explanation", ""),
+        "payload": payload,
+        "source": "server-side-guard",
+    })
+
+    if is_json_request(request):
+        return jsonify({"block": True, "message": "Your request was blocked by the security firewall."}), 403
+
+    return render_template_string(BLOCK_HTML), 403
 
 # -----------------------------
 # Core ML helpers
@@ -352,7 +487,12 @@ def index():
 def waf_api():
     """
     Expects: {"payload": "...", "source": "search|login|register"}
-    Returns: {"block": true/false, "attack_type": ..., "confidence": ..., "explanation": ...}
+    Returns (client-safe):
+      - on block: {"block": true, "message": "Your request was blocked by the security firewall."}
+      - on allow: {"block": false}
+
+    Full details (attack_type/confidence/explanation/payload/timestamp/source) are stored only on the server
+    in `alert_store` and visible via `/admin`.
     """
     data = request.get_json(silent=True)
     if not data or "payload" not in data:
@@ -372,8 +512,9 @@ def waf_api():
             "payload": payload,
             "source": source
         })
+        return jsonify({"block": True, "message": "Your request was blocked by the security firewall."}), 403
 
-    return jsonify(res)
+    return jsonify({"block": False})
 
 
 # ============================================================
@@ -434,6 +575,12 @@ def waf_options():
 @app.route("/api/notify", methods=["OPTIONS"])
 def notify_options():
     return Response(status=200)
+
+
+# ============================================================
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
 
 
 # ============================================================
